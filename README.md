@@ -31,21 +31,42 @@ The official plugin activation path has [multiple open bugs](https://github.com/
 
 ## Quick start
 
-### 1. Build
+### 1. Get the binary
+
+**Option A -- Pre-built binary** (recommended):
+
+Download from [GitHub Releases](https://github.com/gohyperdev/hdcd-telegram/releases) for your platform (Linux x86_64/ARM64, macOS Intel/Apple Silicon, Windows). Then verify:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+On macOS, remove the quarantine flag:
+```bash
+chmod +x ./hdcd-telegram
+xattr -d com.apple.quarantine ./hdcd-telegram
+```
+
+**Option B -- Build from source:**
 
 ```bash
 git clone https://github.com/gohyperdev/hdcd-telegram.git
 cd hdcd-telegram
 cargo build --release
+# Binary: target/release/hdcd-telegram
 ```
 
-Requires Rust 1.80+. No native dependencies. The binary lands in `target/release/hdcd-telegram`.
+Requires Rust 1.80+. No native dependencies.
 
-### 2. Configure bot token
+### 2. Create a Telegram bot
 
-If you already used the official Telegram plugin, your token is in `~/.claude/channels/telegram/.env` -- skip this step.
+If you already have a bot token (e.g. from the official plugin at `~/.claude/channels/telegram/.env`), skip to [step 3](#3-configure-the-bot-for-groups-important).
 
-Otherwise, create a bot via [@BotFather](https://t.me/BotFather) and save the token:
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`
+3. Choose a display name (e.g. "My Claude Agent")
+4. Choose a username ending in `bot` (e.g. `my_claude_agent_bot`)
+5. BotFather replies with your **bot token** -- save it:
 
 ```bash
 mkdir -p ~/.claude/channels/telegram
@@ -53,7 +74,26 @@ echo "TELEGRAM_BOT_TOKEN=123456789:AAH..." > ~/.claude/channels/telegram/.env
 chmod 600 ~/.claude/channels/telegram/.env
 ```
 
-### 3. Register as MCP server
+### 3. Configure the bot for groups (important)
+
+> **This step is critical if you want the bot to work in group chats.** By default, Telegram bots in "privacy mode" only see messages that start with `/` or explicitly @mention the bot. You must disable privacy mode so the bot can see all messages in the group.
+
+1. Message [@BotFather](https://t.me/BotFather) → send `/setprivacy`
+2. Select your bot
+3. Choose **Disable**
+
+BotFather confirms: "Privacy mode is disabled."
+
+> **Order matters:** If you already added the bot to a group _before_ disabling privacy mode, the change won't take effect for that group. You must **remove the bot from the group and re-add it** after changing the privacy setting.
+
+After adding the bot to a group:
+
+1. **Promote the bot to admin** (required for it to read all messages)
+2. **Someone must send a message** in the group for the bot to register the `chat_id`
+
+For **1:1 DMs** (private chats), no extra configuration is needed -- the bot sees all messages by default.
+
+### 4. Register as MCP server
 
 Add to your project's `.mcp.json` (or `~/.claude.json` for global):
 
@@ -68,7 +108,9 @@ Add to your project's `.mcp.json` (or `~/.claude.json` for global):
 }
 ```
 
-### 4. Launch Claude Code
+Replace `/path/to/hdcd-telegram` with the actual path to the binary (e.g. `./hdcd-telegram`, `/usr/local/bin/hdcd-telegram`, or the full path to `target/release/hdcd-telegram`).
+
+### 5. Launch Claude Code
 
 ```bash
 claude --dangerously-load-development-channels server:telegram
@@ -76,7 +118,12 @@ claude --dangerously-load-development-channels server:telegram
 
 > **Why `--dangerously-load-development-channels`?** See [Known issue](#known-issue---channels-plugin-is-broken) above. This flag activates channel routing for servers registered in `.mcp.json`. It shows a one-time confirmation prompt.
 
-### 5. Pair your Telegram account
+**Verify it works:** On startup, Claude Code should show the telegram MCP server as connected. If you see `--dangerously-load-development-channels ignored (server:telegram)`, check that:
+- The server name in `.mcp.json` is exactly `"telegram"` (must match `server:telegram`)
+- The `.mcp.json` is in the directory you launched `claude` from, or in `~/.claude.json` for global
+- The binary path in `"command"` is correct and executable
+
+### 6. Pair your Telegram account
 
 DM your bot on Telegram. It replies with a 6-character pairing code. In your Claude Code session:
 
@@ -85,6 +132,46 @@ DM your bot on Telegram. It replies with a 6-character pairing code. In your Cla
 ```
 
 Done. Your next DM reaches Claude.
+
+## Troubleshooting
+
+### "Channels are not currently available"
+
+This is a Claude Code issue, not a plugin issue. The `--dangerously-load-development-channels` flag should bypass this. If it doesn't:
+
+1. **Check Claude Code version**: run `claude --version`. Versions before 2.1.90 may not support the flag correctly.
+2. **Check your auth**: some features require claude.ai OAuth (not API key).
+3. **Check `.mcp.json` is loaded**: the telegram server must appear in the MCP server list at startup.
+
+### Bot shows "typing" but never replies
+
+The plugin is receiving your message and forwarding it to Claude Code, but Claude Code isn't routing it into the conversation. This means:
+
+1. **The MCP server is working** (good)
+2. **The channel notification is being sent** (good)
+3. **Claude Code is not processing the inbound notification** (the bug)
+
+Check:
+- Are you using `--dangerously-load-development-channels server:telegram`? (Not `--channels plugin:...`)
+- Is the startup output showing the channel as active (not "ignored")?
+- Try restarting Claude Code -- some sessions lose channel routing after the first turn
+
+### 409 Conflict / bot doesn't respond
+
+Another process is polling the same bot token. This happens when:
+- A previous Claude Code session didn't shut down cleanly
+- You're running multiple instances with the same bot token
+
+Fix: kill any leftover `hdcd-telegram` or `bun` processes, then restart.
+
+```bash
+pkill -f hdcd-telegram
+pkill -f "bun.*telegram"
+```
+
+### Bot doesn't see messages in group
+
+See [step 3](#3-configure-the-bot-for-groups-important) -- privacy mode must be disabled, and the bot must be re-added to the group after the change.
 
 ## Voice transcription (optional)
 
