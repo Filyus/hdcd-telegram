@@ -87,11 +87,11 @@ If you already have a bot token (e.g. from the official plugin at `~/.claude/cha
 
 ```bash
 mkdir -p ~/.claude/channels/telegram
-echo "TELEGRAM_BOT_TOKEN=123456789:AAH..." > ~/.claude/channels/telegram/.env
+echo "HDCD_TELEGRAM_BOT_TOKEN=123456789:AAH..." > ~/.claude/channels/telegram/.env
 chmod 600 ~/.claude/channels/telegram/.env
 ```
 
-> **How hdcd-telegram finds the token:** On startup, the binary automatically reads `TELEGRAM_BOT_TOKEN` from `~/.claude/channels/telegram/.env`. This is the same location the official Telegram plugin uses — no extra wiring needed. If you need a custom location, set the `TELEGRAM_STATE_DIR` environment variable (see [Configuration](#configuration)).
+> **How hdcd-telegram finds the token:** On startup, the binary checks `HDCD_TELEGRAM_BOT_TOKEN` first (env, then `.env` file), falling back to `TELEGRAM_BOT_TOKEN` for backward compatibility. Using the dedicated variable avoids conflict when running alongside the official Telegram plugin. If you need a custom state directory, set `TELEGRAM_STATE_DIR` (see [Configuration](#configuration)).
 
 ### 3. Configure the bot for groups (important)
 
@@ -282,12 +282,31 @@ If whisper or ffmpeg are not installed, voice messages are forwarded as `"(voice
 
 | Env var | Default | Description |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | *(required)* | Bot token from [@BotFather](https://t.me/BotFather). Also read from `~/.claude/channels/telegram/.env`. |
+| `HDCD_TELEGRAM_BOT_TOKEN` | *(preferred)* | Bot token from [@BotFather](https://t.me/BotFather). Takes priority over `TELEGRAM_BOT_TOKEN`. Avoids conflict when running alongside the official Telegram plugin. Also read from `~/.claude/channels/telegram/.env`. |
+| `TELEGRAM_BOT_TOKEN` | *(fallback)* | Bot token — backward compatible. Used if `HDCD_TELEGRAM_BOT_TOKEN` is not set. |
 | `TELEGRAM_STATE_DIR` | `~/.claude/channels/telegram` | State directory (access.json, inbox, pairing codes) |
 | `WHISPER_MODEL` | `small` | Whisper model size (`tiny`, `base`, `small`, `medium`, `large`) |
 | `WHISPER_LANGUAGE` | auto-detect | Language hint (`Polish`, `English`, etc.) |
 | `HDCD_ECHO_TRANSCRIPT` | `true` | Send transcript back for user confirmation before delivering to Claude |
 | `RUST_LOG` | `hdcd_telegram=info` | Log level filter ([`tracing-subscriber`](https://docs.rs/tracing-subscriber) format) |
+
+## Running alongside the official Telegram plugin
+
+Since v0.1.2, hdcd-telegram supports `HDCD_TELEGRAM_BOT_TOKEN` as a dedicated env var. This lets you run both plugins with separate bots — no polling conflict:
+
+```bash
+# ~/.claude/channels/telegram/.env
+HDCD_TELEGRAM_BOT_TOKEN=<your-hdcd-bot-token>      # hdcd-telegram reads this first
+TELEGRAM_BOT_TOKEN=<official-plugin-bot-token>      # official plugin reads this
+```
+
+Launch with both channels:
+```bash
+claude --dangerously-load-development-channels plugin:hdcd-telegram@hyperdev-plugins \
+       --dangerously-load-development-channels plugin:telegram@claude-plugins-official
+```
+
+If only `TELEGRAM_BOT_TOKEN` is set, hdcd-telegram uses it as before — fully backward compatible.
 
 ## Migrating from the official plugin
 
