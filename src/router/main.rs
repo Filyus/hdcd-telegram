@@ -305,9 +305,23 @@ async fn handle_update(
     update: &types::Update,
     state: &Arc<Mutex<RouterState>>,
 ) -> Result<()> {
+    // ALLOWLIST INVARIANT: any new update variant handled below MUST call
+    // is_allowed() before dispatching to session-affecting logic. The
+    // early-return here only covers variants we ignore entirely.
     let msg = match &update.message {
         Some(m) => m,
-        None => return Ok(()),
+        None => {
+            let variant = if update.callback_query.is_some() {
+                "callback_query"
+            } else {
+                "other"
+            };
+            debug!(
+                update_id = update.update_id,
+                variant, "skipping non-message update (allowlist enforced only on messages)"
+            );
+            return Ok(());
+        }
     };
 
     let mut s = state.lock().await;
