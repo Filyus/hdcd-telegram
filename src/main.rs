@@ -30,7 +30,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
 use tokio::sync::Mutex;
@@ -39,6 +39,7 @@ use tracing::{debug, error, info, warn};
 use hdcd_telegram::router::{config as router_config, mailbox, sessions};
 use hdcd_telegram::telegram::api::BotCommand;
 use hdcd_telegram::telegram::{api, handlers, permission, polling, tools, transcribe, types};
+use hdcd_telegram::token;
 
 /// MCP protocol version.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -89,77 +90,6 @@ fn state_dir() -> Result<PathBuf> {
     };
     std::fs::create_dir_all(&dir).with_context(|| format!("create state dir {}", dir.display()))?;
     Ok(dir)
-}
-
-/// Load the bot token from env or the `.env` file in the state directory.
-///
-/// Checks in priority order:
-/// 1. `HDCD_TELEGRAM_BOT_TOKEN` env var (preferred, avoids conflict with official plugin)
-/// 2. `TELEGRAM_BOT_TOKEN` env var (backward compatible)
-/// 3. `HDCD_TELEGRAM_BOT_TOKEN=` line in `.env` file
-/// 4. `TELEGRAM_BOT_TOKEN=` line in `.env` file (backward compatible)
-fn load_token(state_dir: &std::path::Path) -> Result<String> {
-    // Check env vars: HDCD_TELEGRAM_BOT_TOKEN takes priority over TELEGRAM_BOT_TOKEN
-    for var_name in ["HDCD_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"] {
-        if let Ok(token) = std::env::var(var_name) {
-            if !token.is_empty() {
-                return Ok(token);
-            }
-        }
-    }
-
-    // Try loading from ~/.claude/channels/telegram/.env
-    let env_file = state_dir.join(".env");
-    if env_file.exists() {
-        // Warn if the .env file is world-readable (Unix only).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&env_file) {
-                let mode = meta.permissions().mode();
-                if mode & 0o044 != 0 {
-                    warn!(
-                        path = %env_file.display(),
-                        "WARNING: {} is world-readable, consider: chmod 600 {}",
-                        env_file.display(),
-                        env_file.display()
-                    );
-                }
-            }
-        }
-
-        let content = std::fs::read_to_string(&env_file)
-            .with_context(|| format!("read {}", env_file.display()))?;
-        // HDCD_TELEGRAM_BOT_TOKEN takes priority over TELEGRAM_BOT_TOKEN in .env too
-        for prefix in ["HDCD_TELEGRAM_BOT_TOKEN=", "TELEGRAM_BOT_TOKEN="] {
-            for line in content.lines() {
-                if let Some(rest) = line.strip_prefix(prefix) {
-                    // Strip surrounding quotes (common footgun when copying from other tools).
-                    let trimmed = rest.trim();
-                    let token = trimmed
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .or_else(|| {
-                            trimmed
-                                .strip_prefix('\'')
-                                .and_then(|s| s.strip_suffix('\''))
-                        })
-                        .unwrap_or(trimmed)
-                        .to_string();
-                    if !token.is_empty() {
-                        return Ok(token);
-                    }
-                }
-            }
-        }
-    }
-
-    bail!(
-        "Bot token required — set HDCD_TELEGRAM_BOT_TOKEN (or TELEGRAM_BOT_TOKEN for backward compatibility)\n  \
-         in env or {}\n  \
-         format: HDCD_TELEGRAM_BOT_TOKEN=123456789:AAH...",
-        state_dir.join(".env").display()
-    )
 }
 
 /// Write one JSON-RPC frame to stdout.
@@ -256,7 +186,7 @@ async fn main() -> Result<()> {
 
 async fn run_standalone_mode() -> Result<()> {
     let sd = state_dir()?;
-    let token = load_token(&sd)?;
+    let token = token::load_token(&sd)?;
     let inbox_dir = sd.join("inbox");
     std::fs::create_dir_all(&inbox_dir)?;
 
@@ -559,8 +489,7 @@ async fn run_router_mode() -> Result<()> {
         let mut known_pid = claude_pid;
         let mut last_seen = initial_claude_session_id;
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.tick().await; // consume the immediate first tick
             loop {
                 tokio::select! {
@@ -610,8 +539,7 @@ async fn run_router_mode() -> Result<()> {
     let inbox_poll_pos = inbox_pos_path.clone();
     let inbox_cancel = cancel.clone();
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -748,8 +676,7 @@ async fn run_router_mode() -> Result<()> {
         disconnected: true,
         claude_session_id: reg.claude_session_id,
     };
-    let disc_json =
-        serde_json::to_string_pretty(&disconnect_reg).unwrap_or_default();
+    let disc_json = serde_json::to_string_pretty(&disconnect_reg).unwrap_or_default();
     let _ = std::fs::write(&reg_path, format!("{disc_json}\n"));
 
     cancel.cancel();
@@ -892,7 +819,9 @@ async fn router_tool_call(
                 rename_to: None,
             };
             mailbox::append_line(outbox_path, &outbox_msg)?;
-            Ok(json!({ "content": [{ "type": "text", "text": format!("edited (via router, id: {message_id})") }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": format!("edited (via router, id: {message_id})") }] }),
+            )
         }
         "download_attachment" => {
             // In router mode, attachments are downloaded by the router
@@ -926,7 +855,9 @@ async fn router_tool_call(
                 rename_to: Some(title.to_string()),
             };
             mailbox::append_line(outbox_path, &outbox_msg)?;
-            Ok(json!({ "content": [{ "type": "text", "text": format!("renamed to \"{title}\" (via router)") }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": format!("renamed to \"{title}\" (via router)") }] }),
+            )
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
@@ -952,7 +883,10 @@ fn ensure_router_running(state_dir: &std::path::Path) -> Result<()> {
                         info!(pid, "router already running");
                         return Ok(());
                     }
-                    info!(pid, "router.lock found but PID is dead, launching new router");
+                    info!(
+                        pid,
+                        "router.lock found but PID is dead, launching new router"
+                    );
                 }
             }
         }
@@ -960,7 +894,9 @@ fn ensure_router_running(state_dir: &std::path::Path) -> Result<()> {
 
     // Find hdcd-router binary next to this binary.
     let self_exe = std::env::current_exe().context("cannot determine own executable path")?;
-    let self_dir = self_exe.parent().context("executable has no parent directory")?;
+    let self_dir = self_exe
+        .parent()
+        .context("executable has no parent directory")?;
 
     let router_name = if cfg!(windows) {
         "hdcd-router.exe"
@@ -1004,9 +940,9 @@ fn ensure_router_running(state_dir: &std::path::Path) -> Result<()> {
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
-    let child = cmd.spawn().with_context(|| {
-        format!("failed to spawn {}", router_exe.display())
-    })?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", router_exe.display()))?;
     info!(pid = child.id(), "hdcd-router spawned");
 
     // Wait briefly for the router to write router.lock.
@@ -1044,7 +980,14 @@ async fn check_approvals(api: &api::BotApi, approved_dir: &std::path::Path) {
         let sender_id = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         match api
-            .send_message(&sender_id, "Paired! Say hi to Claude.", None, None, None, None)
+            .send_message(
+                &sender_id,
+                "Paired! Say hi to Claude.",
+                None,
+                None,
+                None,
+                None,
+            )
             .await
         {
             Ok(_) => {
