@@ -753,17 +753,7 @@ async fn process_registrations(
 async fn close_dead_sessions(state: &Arc<Mutex<RouterState>>) -> Vec<String> {
     let dead: Vec<String> = {
         let s = state.lock().await;
-        s.registry
-            .active_sessions()
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .pid
-                    .map(|pid| !sessions::SessionRegistry::is_pid_alive(pid))
-                    .unwrap_or(false)
-            })
-            .map(|(id, _)| id.to_string())
-            .collect()
+        s.registry.dead_session_ids()
     };
 
     for session_id in &dead {
@@ -908,5 +898,24 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v["pid"].is_number());
         assert!(v["heartbeat"].is_string());
+    }
+
+    #[test]
+    fn lock_guard_is_exclusive() {
+        // First acquisition wins; second must fail immediately (not block)
+        // so a double-start of the router surfaces as a clean error
+        // instead of hanging on the OS lock.
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_lock_guard(dir.path()).expect("first acquire");
+        let err = acquire_lock_guard(dir.path()).expect_err("second should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("lock") || msg.contains(LOCK_GUARD_FILE),
+            "unexpected error: {msg}"
+        );
+        drop(first);
+
+        // After the holder drops, a fresh acquire succeeds.
+        let _third = acquire_lock_guard(dir.path()).expect("re-acquire after drop");
     }
 }

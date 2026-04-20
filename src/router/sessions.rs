@@ -228,6 +228,18 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// IDs of active sessions whose recorded PID is no longer alive.
+    /// Used by the startup reconcile + periodic health check to decide
+    /// which topics to close. Sessions without a PID (pid = None) are
+    /// treated as alive — we can't contradict what we don't know.
+    pub fn dead_session_ids(&self) -> Vec<String> {
+        self.active_sessions()
+            .iter()
+            .filter(|(_, e)| e.pid.map(|p| !Self::is_pid_alive(p)).unwrap_or(false))
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
     /// Check if a PID is still alive (platform-specific).
     pub fn is_pid_alive(pid: u32) -> bool {
         #[cfg(unix)]
@@ -380,6 +392,57 @@ mod tests {
         assert!(!reg.sessions.contains_key("old"));
         assert_eq!(reg.activity_count("new"), 2);
         assert_eq!(reg.session_by_topic(100), Some("new"));
+    }
+
+    #[test]
+    fn dead_session_ids_finds_sessions_with_nonexistent_pid() {
+        // u32::MAX is reliably not a live PID on either OS. A session
+        // whose bound PID is dead must show up in `dead_session_ids`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = SessionRegistry::load(dir.path());
+
+        let dead_reg = Registration {
+            session_id: "dead".into(),
+            label: "dead".into(),
+            pid: Some(u32::MAX),
+            cwd: None,
+            registered_at: "2026-04-11T15:00:00Z".into(),
+            disconnected: false,
+            claude_session_id: None,
+        };
+        reg.bind("dead", 10, &dead_reg);
+
+        let no_pid = Registration {
+            session_id: "nopid".into(),
+            label: "nopid".into(),
+            pid: None,
+            cwd: None,
+            registered_at: "2026-04-11T15:00:00Z".into(),
+            disconnected: false,
+            claude_session_id: None,
+        };
+        reg.bind("nopid", 11, &no_pid);
+
+        let dead = reg.dead_session_ids();
+        assert_eq!(dead, vec!["dead".to_string()]);
+    }
+
+    #[test]
+    fn dead_session_ids_ignores_closed_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = SessionRegistry::load(dir.path());
+        let r = Registration {
+            session_id: "s".into(),
+            label: "s".into(),
+            pid: Some(u32::MAX),
+            cwd: None,
+            registered_at: "2026-04-11T15:00:00Z".into(),
+            disconnected: false,
+            claude_session_id: None,
+        };
+        reg.bind("s", 1, &r);
+        reg.close("s");
+        assert!(reg.dead_session_ids().is_empty());
     }
 
     #[test]
