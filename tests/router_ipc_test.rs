@@ -83,6 +83,7 @@ fn router_mode_ipc_flow() {
         .arg("--router")
         .env("ROUTER_STATE_DIR", state_path.as_os_str())
         .env("RUST_LOG", "hdcd_telegram=debug")
+        .env("HDCD_SKIP_SESSION_DISCOVERY", "1")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

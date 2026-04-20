@@ -31,6 +31,17 @@ pub struct SessionEntry {
     /// `editForumTopic` calls when the title hasn't changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Claude Code's sessionId (from `~/.claude/sessions/{PID}.json`).
+    /// Stable across MCP restarts — enables `claude --resume <id>` to
+    /// reattach to the original forum topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
+    /// Count of real Telegram messages routed through this session —
+    /// inbound (Telegram→MCP notifications) plus outbound (MCP `reply`
+    /// and `edit_message` delivered). Lets us tell parasitic topics
+    /// (never saw traffic) from topics worth preserving on rebind.
+    #[serde(default)]
+    pub message_count: u32,
 }
 
 /// Registration request written by an MCP server to `register/<session-id>.json`.
@@ -43,6 +54,8 @@ pub struct Registration {
     pub registered_at: String,
     #[serde(default)]
     pub disconnected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 /// In-memory session registry backed by `sessions.json`.
@@ -82,8 +95,27 @@ impl SessionRegistry {
         }
     }
 
-    /// Register a new session or update an existing one.
-    pub fn register(&mut self, session_id: &str, topic_id: i64, reg: &Registration) {
+    /// Bind a session to a topic. If another entry already owns the same
+    /// topic (e.g. a closed prior session this `--resume`/`/resume` is
+    /// reattaching to) it is evicted — one session_id ↔ one topic_id, no
+    /// ambiguity. Any existing message_count for this topic carries over,
+    /// so a reattached topic isn't treated as parasitic on later rebind.
+    pub fn bind(&mut self, session_id: &str, topic_id: i64, reg: &Registration) {
+        let mut carried: u32 = 0;
+        let mut dupes: Vec<String> = Vec::new();
+        for (id, e) in &self.sessions {
+            if e.topic_id != topic_id {
+                continue;
+            }
+            carried = carried.max(e.message_count);
+            if id.as_str() != session_id {
+                dupes.push(id.clone());
+            }
+        }
+        for id in dupes {
+            self.sessions.remove(&id);
+        }
+
         self.sessions.insert(
             session_id.to_string(),
             SessionEntry {
@@ -95,9 +127,47 @@ impl SessionRegistry {
                 registered_at: reg.registered_at.clone(),
                 closed_at: None,
                 title: None,
+                claude_session_id: reg.claude_session_id.clone(),
+                message_count: carried,
             },
         );
         self.save();
+    }
+
+    /// Count of real Telegram messages observed on this session.
+    pub fn activity_count(&self, session_id: &str) -> u32 {
+        self.sessions
+            .get(session_id)
+            .map(|e| e.message_count)
+            .unwrap_or(0)
+    }
+
+    /// Bump the activity counter. Called after a successful inbound
+    /// notification or outbound delivery. Persists on every change so a
+    /// router crash never loses activity that's already been sent.
+    pub fn increment_activity(&mut self, session_id: &str) {
+        if let Some(e) = self.sessions.get_mut(session_id) {
+            e.message_count = e.message_count.saturating_add(1);
+            self.save();
+        }
+    }
+
+    /// Current claude_session_id for a session, if any.
+    pub fn claude_session_id_of(&self, session_id: &str) -> Option<&str> {
+        self.sessions
+            .get(session_id)
+            .and_then(|e| e.claude_session_id.as_deref())
+    }
+
+    /// Find a prior entry matching the given Claude sessionId. Returns
+    /// `(router_session_id, topic_id)` for any entry (active or closed) —
+    /// used both to reattach on `claude --resume <id>` and to forget a
+    /// stale entry whose Telegram topic has been deleted out from under us.
+    pub fn find_by_claude_session(&self, claude_session_id: &str) -> Option<(&str, i64)> {
+        self.sessions
+            .iter()
+            .find(|(_, e)| e.claude_session_id.as_deref() == Some(claude_session_id))
+            .map(|(id, e)| (id.as_str(), e.topic_id))
     }
 
     /// Record a new topic title for a session. Returns `true` if the title
@@ -120,6 +190,16 @@ impl SessionRegistry {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             entry.state = SessionState::Closed;
             entry.closed_at = Some(chrono::Utc::now().to_rfc3339());
+            self.save();
+        }
+    }
+
+    /// Drop a session entry entirely. Used when the bound topic has been
+    /// deleted (parasitic with zero activity) — keeping the closed
+    /// entry would leave a dangling topic_id that `find_by_claude_session`
+    /// could later return and drive a failed reopen on resume.
+    pub fn forget(&mut self, session_id: &str) {
+        if self.sessions.remove(session_id).is_some() {
             self.save();
         }
     }
@@ -194,9 +274,10 @@ mod tests {
             cwd: Some("/home/user/project".into()),
             registered_at: "2026-04-11T15:00:00Z".into(),
             disconnected: false,
+            claude_session_id: None,
         };
 
-        reg.register("abc-123", 42, &registration);
+        reg.bind("abc-123", 42, &registration);
         assert_eq!(reg.sessions.len(), 1);
         assert_eq!(reg.topic_by_session("abc-123"), Some(42));
         assert_eq!(reg.session_by_topic(42), Some("abc-123"));
@@ -219,8 +300,9 @@ mod tests {
             cwd: None,
             registered_at: "2026-04-11T15:00:00Z".into(),
             disconnected: false,
+            claude_session_id: None,
         };
-        reg.register("s1", 10, &registration);
+        reg.bind("s1", 10, &registration);
 
         reg.close("s1");
         assert_eq!(
@@ -243,6 +325,7 @@ mod tests {
             cwd: None,
             registered_at: "2026-04-11T15:00:00Z".into(),
             disconnected: false,
+            claude_session_id: None,
         };
         let r2 = Registration {
             session_id: "b".into(),
@@ -251,13 +334,57 @@ mod tests {
             cwd: None,
             registered_at: "2026-04-11T15:00:00Z".into(),
             disconnected: false,
+            claude_session_id: None,
         };
-        reg.register("a", 1, &r1);
-        reg.register("b", 2, &r2);
+        reg.bind("a", 1, &r1);
+        reg.bind("b", 2, &r2);
         reg.close("a");
 
         let active = reg.active_sessions();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].0, "b");
+    }
+
+    #[test]
+    fn bind_evicts_prior_owner_and_carries_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = SessionRegistry::load(dir.path());
+
+        let old = Registration {
+            session_id: "old".into(),
+            label: "old".into(),
+            pid: None,
+            cwd: None,
+            registered_at: "2026-04-11T15:00:00Z".into(),
+            disconnected: false,
+            claude_session_id: Some("claude-X".into()),
+        };
+        reg.bind("old", 100, &old);
+        reg.increment_activity("old");
+        reg.increment_activity("old");
+        reg.close("old");
+
+        let new = Registration {
+            session_id: "new".into(),
+            label: "new".into(),
+            pid: None,
+            cwd: None,
+            registered_at: "2026-04-11T15:05:00Z".into(),
+            disconnected: false,
+            claude_session_id: Some("claude-X".into()),
+        };
+        reg.bind("new", 100, &new);
+
+        assert!(!reg.sessions.contains_key("old"));
+        assert_eq!(reg.activity_count("new"), 2);
+        assert_eq!(reg.session_by_topic(100), Some("new"));
+    }
+
+    #[test]
+    fn increment_activity_saturates_on_unknown_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = SessionRegistry::load(dir.path());
+        reg.increment_activity("ghost"); // must not panic
+        assert_eq!(reg.activity_count("ghost"), 0);
     }
 }

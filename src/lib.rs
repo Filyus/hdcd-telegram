@@ -8,5 +8,6 @@
 //! access control, Bot API client, message handlers, polling, tools,
 //! voice transcription, and shared types.
 
+pub mod claude_session;
 pub mod router;
 pub mod telegram;

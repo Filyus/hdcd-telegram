@@ -521,6 +521,30 @@ impl BotApi {
         Ok(())
     }
 
+    pub async fn delete_forum_topic(&self, chat_id: &str, message_thread_id: i64) -> Result<()> {
+        let body = json!({
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+        });
+        let resp: GenericResponse = self
+            .client
+            .post(self.url("deleteForumTopic"))
+            .json(&body)
+            .send()
+            .await
+            .context("deleteForumTopic request")?
+            .json()
+            .await
+            .context("deleteForumTopic parse")?;
+        if !resp.ok {
+            bail!(
+                "deleteForumTopic failed: {}",
+                resp.description.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
     pub async fn edit_forum_topic(
         &self,
         chat_id: &str,

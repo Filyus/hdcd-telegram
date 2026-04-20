@@ -496,6 +496,21 @@ async fn run_router_mode() -> Result<()> {
 
     info!(session_id, label, "starting in router mode");
 
+    // Read Claude's sessionId synchronously from `~/.claude/sessions/
+    // {claude_pid}.json`. Do NOT block waiting for it to "settle" — on
+    // `claude --resume` without an ID, the file is rewritten only after
+    // the user picks an entry from the interactive list, which can take
+    // arbitrarily long. A background watcher below observes changes and
+    // rewrites the registration so the router can rebind topics.
+    let claude_pid = hdcd_telegram::claude_session::discover_claude_pid();
+    let initial_claude_session_id =
+        claude_pid.and_then(hdcd_telegram::claude_session::current_session_id);
+    if let Some(ref id) = initial_claude_session_id {
+        info!(claude_session_id = %id, ?claude_pid, "discovered initial claude sessionId");
+    } else {
+        warn!("claude sessionId not discoverable — resume will not match prior topic");
+    }
+
     // Write registration file.
     let reg = sessions::Registration {
         session_id: session_id.clone(),
@@ -506,6 +521,7 @@ async fn run_router_mode() -> Result<()> {
             .map(|p| p.to_string_lossy().into_owned()),
         registered_at: chrono::Utc::now().to_rfc3339(),
         disconnected: false,
+        claude_session_id: initial_claude_session_id.clone(),
     };
     let reg_path = register_dir.join(format!("{session_id}.json"));
     let reg_json = serde_json::to_string_pretty(&reg).context("serialize registration")?;
@@ -522,6 +538,71 @@ async fn run_router_mode() -> Result<()> {
 
     // Cancellation token for clean shutdown.
     let cancel = tokio_util::sync::CancellationToken::new();
+
+    // Spawn claude-sessionId watcher: runs unconditionally for the life
+    // of the MCP. Rediscovers Claude's PID on every tick until one is
+    // found (MCP can start before Claude has written its PID file), then
+    // observes value changes and rewrites the registration on each one
+    // (interactive --resume pick, /resume, /clear). Router picks up the
+    // rewrite on its next registration poll and rebinds topics.
+    //
+    // Uses a dedicated cancel token so we can stop the watcher before
+    // writing the disconnect marker on shutdown — otherwise a tick that
+    // observes Claude's PID file vanishing would race-overwrite the
+    // marker with `disconnected: false` and the router would never see
+    // the disconnect.
+    let watcher_cancel = tokio_util::sync::CancellationToken::new();
+    let watcher_handle = {
+        let watch_reg = reg.clone();
+        let watch_reg_path = reg_path.clone();
+        let watch_cancel = watcher_cancel.clone();
+        let mut known_pid = claude_pid;
+        let mut last_seen = initial_claude_session_id;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = watch_cancel.cancelled() => return,
+                }
+                if known_pid.is_none() {
+                    known_pid = hdcd_telegram::claude_session::discover_claude_pid();
+                    if let Some(p) = known_pid {
+                        info!(claude_pid = p, "discovered claude PID (post-start)");
+                    } else {
+                        continue;
+                    }
+                }
+                let pid = known_pid.unwrap();
+                let current = hdcd_telegram::claude_session::current_session_id(pid);
+                if current == last_seen {
+                    continue;
+                }
+                info!(
+                    prev = ?last_seen,
+                    next = ?current,
+                    "claude sessionId changed — rewriting registration"
+                );
+                last_seen = current.clone();
+                let mut updated = watch_reg.clone();
+                updated.claude_session_id = current;
+                match serde_json::to_string_pretty(&updated) {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&watch_reg_path, format!("{json}\n")) {
+                            warn!(
+                                error = %e,
+                                path = %watch_reg_path.display(),
+                                "failed to rewrite registration on rebind"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to serialize updated registration"),
+                }
+            }
+        })
+    };
 
     // Spawn inbox poller — reads inbox file, emits MCP channel notifications.
     let inbox_stdout = Arc::clone(&stdout);
@@ -649,7 +730,14 @@ async fn run_router_mode() -> Result<()> {
         }
     }
 
-    // stdin closed — write disconnect marker and shut down.
+    // stdin closed — stop the watcher BEFORE writing the disconnect
+    // marker. Otherwise, if Claude removed its PID file during shutdown,
+    // the watcher's next tick would see the sessionId vanish and rewrite
+    // the registration with `disconnected: false`, stomping the marker
+    // and leaving the router to think the session is still alive.
+    watcher_cancel.cancel();
+    let _ = watcher_handle.await;
+
     info!("stdin closed; writing disconnect marker");
     let disconnect_reg = sessions::Registration {
         session_id: session_id.clone(),
@@ -658,6 +746,7 @@ async fn run_router_mode() -> Result<()> {
         cwd: reg.cwd,
         registered_at: reg.registered_at,
         disconnected: true,
+        claude_session_id: reg.claude_session_id,
     };
     let disc_json =
         serde_json::to_string_pretty(&disconnect_reg).unwrap_or_default();
@@ -890,10 +979,21 @@ fn ensure_router_running(state_dir: &std::path::Path) -> Result<()> {
 
     info!(path = %router_exe.display(), "launching hdcd-router");
 
+    // Route stderr to a log file in state_dir instead of inheriting from
+    // the spawning MCP. When that MCP exits (e.g. the user closes Claude
+    // before `--resume`), an inherited stderr pipe breaks and subsequent
+    // writes silently kill tracing-backed tasks inside the router.
+    let log_path = state_dir.join("router.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open router log {}", log_path.display()))?;
+
     let mut cmd = std::process::Command::new(&router_exe);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::from(log_file));
 
     // Detach on Windows so the router survives parent exit.
     #[cfg(windows)]

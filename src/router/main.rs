@@ -101,7 +101,12 @@ async fn main() -> Result<()> {
     }));
 
     // Reconcile stale sessions from a previous run.
-    reconcile_sessions(&state).await;
+    let stale = close_dead_sessions(&state).await;
+    if stale.is_empty() {
+        info!("no stale sessions to reconcile");
+    } else {
+        info!(count = stale.len(), "reconciled stale sessions from previous run");
+    }
 
     // Cancellation token for clean shutdown.
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -174,7 +179,7 @@ async fn main() -> Result<()> {
                 _ = interval.tick() => {}
                 _ = health_cancel.cancelled() => return,
             }
-            check_session_health(&health_state).await;
+            close_dead_sessions(&health_state).await;
         }
     });
 
@@ -305,7 +310,7 @@ async fn handle_update(
         None => return Ok(()),
     };
 
-    let s = state.lock().await;
+    let mut s = state.lock().await;
     let chat_id = msg.chat.id.to_string();
 
     // Only handle messages from the configured supergroup.
@@ -407,6 +412,7 @@ async fn handle_update(
 
     let inbox_path = s.inbox_dir.join(format!("{session_id}.jsonl"));
     mailbox::append_line(&inbox_path, &inbox_msg)?;
+    s.registry.increment_activity(&session_id);
 
     info!(
         session_id,
@@ -537,7 +543,11 @@ async fn poll_outbox(
             }
 
             match deliver_outbox_message(api, &supergroup_id, topic_id, &msg).await {
-                Ok(()) => mailbox::commit_pos(&pos_path, end_offset),
+                Ok(()) => {
+                    mailbox::commit_pos(&pos_path, end_offset);
+                    let mut s = state.lock().await;
+                    s.registry.increment_activity(&session_id);
+                }
                 Err(e) => {
                     warn!(
                         session_id,
@@ -570,24 +580,20 @@ async fn deliver_outbox_message(
         return Ok(());
     }
 
+    let parse_mode = if msg.format == "markdownv2" {
+        Some("MarkdownV2")
+    } else {
+        None
+    };
+
     // Handle edits.
     if let Some(edit_id) = msg.edit_message_id {
-        let parse_mode = if msg.format == "markdownv2" {
-            Some("MarkdownV2")
-        } else {
-            None
-        };
         api.edit_message_text(supergroup_id, edit_id, &msg.text, parse_mode)
             .await?;
         return Ok(());
     }
 
     // Regular message send.
-    let parse_mode = if msg.format == "markdownv2" {
-        Some("MarkdownV2")
-    } else {
-        None
-    };
     api.send_message(
         supergroup_id,
         &msg.text,
@@ -645,7 +651,6 @@ async fn process_registrations(
         };
 
         if reg.disconnected {
-            // Session is disconnecting — close its topic.
             let mut s = state.lock().await;
             let has_topic = s.registry.topic_by_session(&reg.session_id).is_some();
             if has_topic {
@@ -664,17 +669,25 @@ async fn process_registrations(
             continue;
         }
 
-        // Check if already registered.
+        // Skip if already reconciled: session known AND claude_session_id
+        // unchanged. Registration file stays on disk so subsequent rewrites
+        // by the MCP-side sessionId watcher trigger rebind on next poll.
         {
             let s = state.lock().await;
-            if s.registry.topic_by_session(&reg.session_id).is_some() {
-                continue; // already registered, skip
+            let known = s.registry.topic_by_session(&reg.session_id).is_some();
+            let same_claude_id = s
+                .registry
+                .claude_session_id_of(&reg.session_id)
+                .map(str::to_string)
+                == reg.claude_session_id;
+            if known && same_claude_id {
+                continue;
             }
         }
 
-        // Skip stale registrations whose MCP process is already dead. Creating
-        // a topic just to have the health checker close it again seconds later
-        // spams the supergroup on router restart.
+        // Skip stale registrations whose MCP process is already dead.
+        // Creating a topic just to have the health checker close it again
+        // seconds later would spam the supergroup on router restart.
         if let Some(pid) = reg.pid {
             if !sessions::SessionRegistry::is_pid_alive(pid) {
                 info!(
@@ -693,42 +706,22 @@ async fn process_registrations(
             }
         }
 
-        // New session — create/reopen topic.
         info!(
             session_id = %reg.session_id,
             label = %reg.label,
             pid = ?reg.pid,
-            "new session registration"
+            claude_session_id = reg.claude_session_id.as_deref().unwrap_or("?"),
+            "reconciling session registration"
         );
 
         let mut s = state.lock().await;
         let RouterState { topic_mgr, registry, .. } = &mut *s;
-        match topic_mgr
-            .ensure_topic(&reg.session_id, &reg, registry)
-            .await
-        {
-            Ok(topic_id) => {
-                info!(
-                    session_id = %reg.session_id,
-                    topic_id,
-                    "session registered"
-                );
-                // Clean up registration file after successful processing.
-                if let Err(e) = std::fs::remove_file(&path) {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to remove registration file"
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    session_id = %reg.session_id,
-                    error = %e,
-                    "failed to create topic for session"
-                );
-            }
+        if let Err(e) = topic_mgr.reconcile_session(&reg, registry).await {
+            error!(
+                session_id = %reg.session_id,
+                error = %e,
+                "failed to reconcile session"
+            );
         }
     }
 
@@ -739,10 +732,12 @@ async fn process_registrations(
 // Health checker
 // ---------------------------------------------------------------------------
 
-/// Reconcile sessions on startup — close any sessions whose PIDs died
-/// while the router was not running.
-async fn reconcile_sessions(state: &Arc<Mutex<RouterState>>) {
-    let stale: Vec<String> = {
+/// Collect active sessions whose MCP PID is no longer alive and close
+/// their topics. Used both at startup (reconcile leftovers from the
+/// previous run) and periodically by the health checker. Returns the
+/// list of session_ids that were closed so the caller can log context.
+async fn close_dead_sessions(state: &Arc<Mutex<RouterState>>) -> Vec<String> {
+    let dead: Vec<String> = {
         let s = state.lock().await;
         s.registry
             .active_sessions()
@@ -757,19 +752,13 @@ async fn reconcile_sessions(state: &Arc<Mutex<RouterState>>) {
             .collect()
     };
 
-    if stale.is_empty() {
-        info!("no stale sessions to reconcile");
-        return;
-    }
-
-    info!(count = stale.len(), "reconciling stale sessions from previous run");
-
-    for session_id in &stale {
+    for session_id in &dead {
+        info!(session_id, "session PID dead, closing topic");
         let mut s = state.lock().await;
         let RouterState { topic_mgr, registry, .. } = &mut *s;
-        info!(session_id, "closing stale session (PID dead)");
         topic_mgr.close_topic(session_id, registry).await;
     }
+    dead
 }
 
 /// Format the build time as the mtime of the current executable, in local
@@ -837,30 +826,6 @@ fn acquire_lock_guard(state_dir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// Check if active sessions' PIDs are still alive. Close topics for dead ones.
-async fn check_session_health(state: &Arc<Mutex<RouterState>>) {
-    let dead_sessions: Vec<String> = {
-        let s = state.lock().await;
-        s.registry
-            .active_sessions()
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .pid
-                    .map(|pid| !sessions::SessionRegistry::is_pid_alive(pid))
-                    .unwrap_or(false)
-            })
-            .map(|(id, _)| id.to_string())
-            .collect()
-    };
-
-    for session_id in dead_sessions {
-        info!(session_id, "session PID dead, closing topic");
-        let mut s = state.lock().await;
-        let RouterState { topic_mgr, registry, .. } = &mut *s;
-        topic_mgr.close_topic(&session_id, registry).await;
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -876,6 +841,8 @@ mod tests {
             registered_at: "2026-04-11T15:00:00Z".to_string(),
             closed_at: None,
             title: None,
+            claude_session_id: None,
+            message_count: 0,
         }
     }
 
