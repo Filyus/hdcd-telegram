@@ -87,31 +87,9 @@ fn parent_of(pid: u32) -> Option<u32> {
         return None;
     }
 
-    let mut mib = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        pid as libc::c_int,
-    ];
-    let mut proc_info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::kinfo_proc>() as libc::size_t;
-
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            &mut proc_info as *mut _ as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || len == 0 {
-        return None;
-    }
-
-    let ppid = proc_info.kp_eproc.e_ppid;
-    (ppid > 0).then_some(ppid as u32)
+    let proc_info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid as i32, 0).ok()?;
+    let ppid = proc_info.pbi_ppid;
+    (ppid > 0).then_some(ppid)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
