@@ -181,3 +181,13 @@ pub fn discover_claude_pid() -> Option<u32> {
     }
     find_claude_pid()
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::parent_of;
+
+    #[test]
+    fn parent_of_self_returns_some() {
+        assert!(parent_of(std::process::id()).is_some());
+    }
+}
